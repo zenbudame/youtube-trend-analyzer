@@ -1,385 +1,232 @@
-import math
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List
-
 import pandas as pd
-import requests
 import streamlit as st
-
-API_BASE = "https://www.googleapis.com/youtube/v3"
-GAMING_CATEGORY_ID = "20"
+from analyzer import add_channel_stats, filter_videos, most_popular, score_df, search_period, search_videos
 
 st.set_page_config(page_title="YouTube Trend Analyzer", page_icon="📈", layout="wide")
-
-
-def api_get(path: str, params: dict, api_key: str) -> dict:
-    params = {**params, "key": api_key}
-    r = requests.get(f"{API_BASE}/{path}", params=params, timeout=30)
-    if not r.ok:
-        try:
-            detail = r.json().get("error", {}).get("message", r.text)
-        except Exception:
-            detail = r.text
-        raise RuntimeError(f"YouTube API error {r.status_code}: {detail}")
-    return r.json()
-
-
-def iso_z(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def duration_to_seconds(s: str) -> int:
-    # Minimal ISO-8601 PT parser for YouTube durations.
-    import re
-    m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", s or "")
-    if not m:
-        return 0
-    h, mnt, sec = [int(x or 0) for x in m.groups()]
-    return h * 3600 + mnt * 60 + sec
-
-
-def video_details(video_ids: List[str], api_key: str) -> pd.DataFrame:
-    rows = []
-    for i in range(0, len(video_ids), 50):
-        ids = video_ids[i:i+50]
-        data = api_get("videos", {
-            "part": "snippet,statistics,contentDetails",
-            "id": ",".join(ids),
-            "maxResults": 50,
-        }, api_key)
-        for item in data.get("items", []):
-            sn = item.get("snippet", {})
-            stats = item.get("statistics", {})
-            content = item.get("contentDetails", {})
-            published = pd.to_datetime(sn.get("publishedAt"), utc=True)
-            age_hours = max((pd.Timestamp.now(tz="UTC") - published).total_seconds() / 3600, 1.0)
-            views = int(stats.get("viewCount", 0) or 0)
-            likes = int(stats.get("likeCount", 0) or 0)
-            comments = int(stats.get("commentCount", 0) or 0)
-            sec = duration_to_seconds(content.get("duration", ""))
-            rows.append({
-                "video_id": item.get("id"),
-                "title": sn.get("title", ""),
-                "channel": sn.get("channelTitle", ""),
-                "channel_id": sn.get("channelId", ""),
-                "published_at": published,
-                "age_hours": age_hours,
-                "views": views,
-                "likes": likes,
-                "comments": comments,
-                "duration_sec": sec,
-                "format": "Shorts候補" if sec <= 180 else "長尺",
-                "views_per_hour": views / age_hours,
-                "like_rate_pct": (likes / views * 100) if views else 0,
-                "comment_rate_pct": (comments / views * 100) if views else 0,
-                "url": f"https://www.youtube.com/watch?v={item.get('id')}",
-            })
-    return pd.DataFrame(rows)
-
-
-def add_channel_stats(df: pd.DataFrame, api_key: str) -> pd.DataFrame:
-    if df.empty:
-        return df
-    ids = df["channel_id"].dropna().unique().tolist()
-    channel_map: Dict[str, dict] = {}
-    for i in range(0, len(ids), 50):
-        data = api_get("channels", {
-            "part": "statistics",
-            "id": ",".join(ids[i:i+50]),
-            "maxResults": 50,
-        }, api_key)
-        for item in data.get("items", []):
-            s = item.get("statistics", {})
-            channel_map[item["id"]] = {
-                "subscribers": int(s.get("subscriberCount", 0) or 0),
-                "channel_total_views": int(s.get("viewCount", 0) or 0),
-            }
-    out = df.copy()
-    out["subscribers"] = out["channel_id"].map(lambda x: channel_map.get(x, {}).get("subscribers", 0))
-    out["views_vs_subscribers"] = out.apply(
-        lambda r: r["views"] / r["subscribers"] if r["subscribers"] else 0, axis=1
-    )
-    return out
-
-
-def score_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    out = df.copy()
-    # Robust, interpretable score: velocity + engagement + breakout ratio.
-    vph = out["views_per_hour"].clip(lower=0)
-    breakout = out.get("views_vs_subscribers", pd.Series(0, index=out.index)).clip(lower=0)
-    like = out["like_rate_pct"].clip(lower=0)
-    comment = out["comment_rate_pct"].clip(lower=0)
-    out["trend_score"] = (
-        45 * (vph.rank(pct=True)) +
-        25 * (like.rank(pct=True)) +
-        15 * (comment.rank(pct=True)) +
-        15 * (breakout.rank(pct=True))
-    ).round(1)
-    return out.sort_values(["trend_score", "views_per_hour"], ascending=False)
-
-
-def search_videos(query: str, days: int, max_results: int, api_key: str,
-                  region: str = "JP", category_id: str = GAMING_CATEGORY_ID) -> pd.DataFrame:
-    after = datetime.now(timezone.utc) - timedelta(days=days)
-    ids = []
-    token = None
-    remaining = max_results
-    while remaining > 0:
-        n = min(50, remaining)
-        params = {
-            "part": "snippet",
-            "type": "video",
-            "q": query,
-            "publishedAfter": iso_z(after),
-            "order": "viewCount",
-            "maxResults": n,
-            "regionCode": region,
-            "videoCategoryId": category_id,
-        }
-        if token:
-            params["pageToken"] = token
-        data = api_get("search", params, api_key)
-        ids.extend([x.get("id", {}).get("videoId") for x in data.get("items", []) if x.get("id", {}).get("videoId")])
-        remaining -= n
-        token = data.get("nextPageToken")
-        if not token:
-            break
-    df = video_details(list(dict.fromkeys(ids)), api_key)
-    return add_channel_stats(df, api_key)
-
-
-def most_popular(max_results: int, api_key: str, region: str = "JP") -> pd.DataFrame:
-    data = api_get("videos", {
-        "part": "snippet,statistics,contentDetails",
-        "chart": "mostPopular",
-        "regionCode": region,
-        "videoCategoryId": GAMING_CATEGORY_ID,
-        "maxResults": min(max_results, 50),
-    }, api_key)
-    ids = [x["id"] for x in data.get("items", [])]
-    df = video_details(ids, api_key)
-    return score_df(add_channel_stats(df, api_key))
-
-
-def search_period(query: str, start: datetime, end: datetime, max_results: int, api_key: str, region: str) -> pd.DataFrame:
-    ids = []
-    token = None
-    remaining = max_results
-    while remaining > 0:
-        n = min(50, remaining)
-        p = {
-            "part": "snippet", "type": "video", "q": query,
-            "publishedAfter": iso_z(start), "publishedBefore": iso_z(end),
-            "order": "viewCount", "maxResults": n, "regionCode": region,
-            "videoCategoryId": GAMING_CATEGORY_ID,
-        }
-        if token:
-            p["pageToken"] = token
-        data = api_get("search", p, api_key)
-        ids += [x.get("id", {}).get("videoId") for x in data.get("items", []) if x.get("id", {}).get("videoId")]
-        remaining -= n
-        token = data.get("nextPageToken")
-        if not token:
-            break
-    return video_details(list(dict.fromkeys(ids)), api_key)
-
-
-def monthly_long_term(query: str, months: int, samples_per_month: int, api_key: str, region: str) -> pd.DataFrame:
-    now = datetime.now(timezone.utc)
-    rows = []
-    for offset in range(months - 1, -1, -1):
-        end = now - timedelta(days=30 * offset)
-        start = end - timedelta(days=30)
-        df = search_period(query, start, end, samples_per_month, api_key, region)
-        rows.append({
-            "month": start.strftime("%Y-%m"),
-            "query": query,
-            "videos_sampled": len(df),
-            "sample_views": int(df["views"].sum()) if not df.empty else 0,
-            "median_views": float(df["views"].median()) if not df.empty else 0,
-            "median_views_per_hour": float(df["views_per_hour"].median()) if not df.empty else 0,
-            "active_channels": int(df["channel_id"].nunique()) if not df.empty else 0,
-        })
-    return pd.DataFrame(rows)
-
-
-def dataframe_download(df: pd.DataFrame, name: str):
-    csv = df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("CSVをダウンロード", csv, file_name=name, mime="text/csv")
-
-
 st.title("📈 YouTube Trend Analyzer")
-st.caption("YouTube Data API v3を使った、日本向けゲーム動画のトレンド分析MVP")
+st.caption("ゲーム動画のトレンドと、自分に近い規模のチャンネルで伸びている動画を探す")
+PRESETS = {"指定なし": (None, None), "0〜1,000人未満": (0, 999), "1,000〜1万人未満": (1000, 9999), "1万〜10万人未満": (10000, 99999), "10万〜100万人未満": (100000, 999999), "100万人以上": (1000000, None), "任意入力": (None, None)}
+
+
+def bounds(label, key, enabled=False):
+    if not enabled and not st.checkbox(f"{label}で絞り込む", key=key + "_on"):
+        return None, None
+    low = st.number_input(f"{label}：最小", min_value=0, value=0, step=1, key=key + "_min")
+    unlimited = st.checkbox(f"{label}：上限なし", value=True, key=key + "_unlimited")
+    high = None if unlimited else st.number_input(f"{label}：最大", min_value=0, value=10000, step=1, key=key + "_max")
+    if high is not None and low > high:
+        st.error(f"{label}の最小値は最大値以下にしてください。")
+        st.stop()
+    return low, high
+
 
 with st.sidebar:
-    st.header("設定")
-    secret_key = ""
+    st.header("接続設定")
     try:
         secret_key = st.secrets.get("YOUTUBE_API_KEY", "")
     except Exception:
-        pass
-    api_key = st.text_input("YouTube Data API Key", value=os.getenv("YOUTUBE_API_KEY", secret_key), type="password")
+        secret_key = ""
+    # Never put the deployed owner's secret in a browser widget.
+    configured_key = os.getenv("YOUTUBE_API_KEY", "") or secret_key
+    api_key = configured_key or st.text_input("YouTube Data API Key", type="password")
+    if configured_key:
+        st.caption("保存済みのAPIキーを使用中")
     region = st.text_input("地域コード", value="JP", max_chars=2).upper()
-    st.caption("APIキーはこのアプリ内でのみ使用します。公開リポジトリに書き込まないでください。")
+    st.header("全タブ共通の絞り込み")
+    preset = st.selectbox("登録者数の規模", list(PRESETS))
+    sub_bounds = bounds("登録者数", "subs", True) if preset == "任意入力" else PRESETS[preset]
+    unknown = st.selectbox("登録者数が非公開・取得不可の動画", ["条件なしの場合のみ含める", "常に除外", "非公開・取得不可のみ"])
+    filters = {"subscribers": sub_bounds, "unknown": {"条件なしの場合のみ含める": "include", "常に除外": "exclude", "非公開・取得不可のみ": "only"}[unknown], "channel_total_views": bounds("チャンネル総再生数", "total"), "channel_video_count": bounds("チャンネル動画本数", "count"), "format": st.selectbox("動画の形式", ["すべて", "Shorts候補", "長尺"])}
+    if st.checkbox("登録者比の下限を指定"):
+        filters["min_ratio"] = st.number_input("登録者比：最小（倍）", min_value=0.0, value=1.0, step=0.5)
+    filters["min_views"] = st.number_input("動画再生数：最小", min_value=0, value=0, step=100)
+    breakout_mode = st.checkbox("小規模で伸びている動画を探す")
+    if breakout_mode:
+        filters["small_max"] = st.number_input("小規模とする登録者数の上限", min_value=1, value=10000, step=1000)
+        ratio = st.number_input("小規模動画の登録者比：最小（倍）", min_value=0.1, value=3.0, step=0.5)
+        filters["min_ratio"] = max(filters.get("min_ratio", 0), ratio)
+    sort_label = st.selectbox("動画ランキング順", ["トレンドスコア", "登録者比", "再生速度", "動画再生数"], index=1 if breakout_mode else 0)
+    sort_col = {"トレンドスコア": "trend_score", "登録者比": "views_vs_subscribers", "再生速度": "views_per_hour", "動画再生数": "views"}[sort_label]
+    st.caption("条件変更は取得済みデータに即時反映され、再検索しません。任意入力の上下限は境界値を含みます。")
+    if unknown == "非公開・取得不可のみ" and (sub_bounds != (None, None) or "min_ratio" in filters):
+        st.warning("登録者数不明の動画は、登録者数・登録者比の数値条件を満たせないため表示されません。")
 
 if not api_key:
-    st.info("左側に YouTube Data API Key を入力すると分析を開始できます。")
+    st.info("左側にAPIキーを入力すると分析できます。APIキーをコードやGitHubへ保存しないでください。")
+st.info("取得した上位動画サンプルをチャンネル規模で絞り込みます。該当0件でもYouTube全体に存在しないとは限りません。取得件数やキーワードを調整してください。")
+st.caption("登録者比＝動画再生数÷現在の登録者数。非公開・取得不可・0人の場合は算出しません。登録者数はAPIの丸め値です。地域コードは視聴地域で、日本語動画だけに限定する指定ではありません。")
+LABELS = {"trend_score": "トレンドスコア", "title": "動画タイトル", "channel": "チャンネル", "format": "形式", "views": "動画再生数", "views_per_hour": "再生数/時間", "like_rate_pct": "高評価率（%）", "comment_rate_pct": "コメント率（%）", "subscribers": "登録者数", "subscriber_status": "登録者数の公開状態", "channel_total_views": "チャンネル総再生数", "channel_video_count": "チャンネル動画本数", "views_vs_subscribers": "登録者比（倍）", "url": "動画URL"}
+SUMMARY_LABELS = {"game": "ゲーム", "period": "投稿期間", "videos_fetched": "取得動画数", "videos_sampled": "条件一致動画数", "sample_views": "サンプル総再生数", "median_views": "再生数の中央値", "median_views_per_hour": "再生速度の中央値", "active_channels": "チャンネル数", "median_like_rate_pct": "高評価率の中央値（%）", "breakout_ratio": "登録者比の中央値（倍）", "median_subscribers": "登録者数の中央値", "engagement": "反応率の指標", "game_trend_score": "ゲームトレンドスコア", "opportunity_score": "狙い目スコア"}
 
-trend_tab, search_tab, games_tab, opportunity_tab, long_tab = st.tabs([
-    "🔥 人気動画", "🔎 キーワード分析", "🎮 ゲーム比較", "🎯 狙い目ランキング", "📅 長期トレンド"
-])
 
-with trend_tab:
+def download(df, name):
+    st.download_button("CSVをダウンロード", df.to_csv(index=False).encode("utf-8-sig"), file_name=name, mime="text/csv", key="csv_" + name)
+
+
+def show_videos(raw, name):
+    df = score_df(filter_videos(raw, filters))
+    st.caption(f"取得 {len(raw):,}件 → 条件一致 {len(df):,}件")
+    if df.empty:
+        st.info("条件に一致する動画がありません。条件を緩めるか、取得件数を増やして再取得してください。")
+        return
+    df = df.sort_values([sort_col, "views"], ascending=False, na_position="last")
+    a, b, c, d = st.columns(4)
+    a.metric("条件一致動画", len(df))
+    b.metric("総再生数", f"{int(df.views.sum()):,}")
+    c.metric("中央値再生数", f"{int(df.views.median()):,}")
+    d.metric("チャンネル数", df.channel_id.nunique())
+    st.dataframe(df[list(LABELS)], column_config={**LABELS, "url": st.column_config.LinkColumn("動画URL"), "views_vs_subscribers": st.column_config.NumberColumn("登録者比（倍）", format="%.2f")}, use_container_width=True, hide_index=True)
+    st.bar_chart(df.head(15).set_index("title")[sort_col])
+    download(df, name)
+
+
+def collect_games(games, days, sample):
+    parts = []
+    progress = st.progress(0)
+    for idx, game in enumerate(games):
+        df = search_videos(game, days, sample, api_key, region, enrich=False)
+        df["game"] = game
+        parts.append(df)
+        progress.progress((idx + 1) / len(games))
+    return add_channel_stats(pd.concat(parts, ignore_index=True), api_key)
+
+
+def summarize(df):
+    def median(col):
+        return df[col].median() if not df.empty and df[col].notna().any() else float("nan")
+    return {"videos_sampled": len(df), "sample_views": int(df.views.sum()) if not df.empty else 0,
+            "median_views": median("views"), "median_views_per_hour": median("views_per_hour"),
+            "active_channels": df.channel_id.nunique() if not df.empty else 0,
+            "median_like_rate_pct": median("like_rate_pct"), "breakout_ratio": median("views_vs_subscribers"),
+            "median_subscribers": median("subscribers"),
+            "engagement": (df.like_rate_pct + 5 * df.comment_rate_pct).median() if not df.empty else float("nan")}
+
+
+tabs = st.tabs(["🔥 人気動画", "🔎 キーワード分析", "🎮 ゲーム比較", "🎯 狙い目ランキング", "📅 長期トレンド"])
+with tabs[0]:
     st.subheader("現在の人気ゲーム動画")
     count = st.slider("取得件数", 10, 50, 30, 10, key="popular_count")
     if st.button("人気動画を取得", disabled=not api_key):
         try:
             with st.spinner("取得中..."):
-                df = most_popular(count, api_key, region)
-            st.session_state["popular_df"] = df
-        except Exception as e:
-            st.error(str(e))
-    df = st.session_state.get("popular_df", pd.DataFrame())
-    if not df.empty:
-        cols = ["trend_score", "title", "channel", "format", "views", "views_per_hour", "like_rate_pct", "comments", "subscribers", "url"]
-        st.dataframe(df[cols], use_container_width=True, hide_index=True)
-        st.bar_chart(df.head(15).set_index("title")["trend_score"])
-        dataframe_download(df, "youtube_popular_games.csv")
+                st.session_state.popular_df = most_popular(count, api_key, region)
+                st.session_state.popular_context = f"取得条件：地域 {region} / 最大 {count}件"
+        except Exception as exc:
+            st.error(str(exc))
+    if "popular_df" in st.session_state:
+        st.caption(st.session_state.popular_context)
+        show_videos(st.session_state.popular_df, "youtube_popular_games.csv")
 
-with search_tab:
+with tabs[1]:
     st.subheader("キーワード別トレンド動画")
-    c1, c2, c3 = st.columns(3)
-    query = c1.text_input("検索キーワード", value="マイクラ")
-    days = c2.selectbox("対象期間", [1, 3, 7, 14, 30, 90], index=2)
-    max_r = c3.selectbox("取得件数", [10, 25, 50, 100], index=2)
-    if st.button("分析する", disabled=not api_key, key="search_btn"):
+    a, b, c = st.columns(3)
+    query = a.text_input("検索キーワード", value="マイクラ")
+    days = b.selectbox("対象期間", [1, 3, 7, 14, 30, 90], index=2)
+    max_r = c.selectbox("取得件数（絞り込み前）", [10, 25, 50, 100, 200, 500], index=2)
+    if st.button("分析する", disabled=not api_key or not query.strip(), key="search_btn"):
         try:
             with st.spinner("検索・分析中..."):
-                df = score_df(search_videos(query, days, max_r, api_key, region))
-            st.session_state["search_df"] = df
-        except Exception as e:
-            st.error(str(e))
-    df = st.session_state.get("search_df", pd.DataFrame())
-    if not df.empty:
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("取得動画", len(df))
-        m2.metric("総再生数", f"{int(df['views'].sum()):,}")
-        m3.metric("中央値再生数", f"{int(df['views'].median()):,}")
-        m4.metric("チャンネル数", int(df["channel_id"].nunique()))
-        st.dataframe(df[["trend_score", "title", "channel", "format", "views", "views_per_hour", "like_rate_pct", "comment_rate_pct", "views_vs_subscribers", "url"]], use_container_width=True, hide_index=True)
-        dataframe_download(df, f"youtube_trend_{query}.csv")
+                st.session_state.search_df = search_videos(query.strip(), days, max_r, api_key, region)
+                st.session_state.search_context = f"取得条件：{query.strip()} / 直近{days}日 / 地域 {region} / 最大 {max_r}件"
+        except Exception as exc:
+            st.error(str(exc))
+    if "search_df" in st.session_state:
+        st.caption(st.session_state.search_context)
+        show_videos(st.session_state.search_df, "youtube_keyword_trend.csv")
 
-with games_tab:
-    st.subheader("ゲームタイトル比較")
-    default_games = "Minecraft\nFortnite\nVALORANT\nApex Legends\nRoblox"
-    games_text = st.text_area("1行に1タイトル", value=default_games, height=150)
-    c1, c2 = st.columns(2)
-    game_days = c1.selectbox("比較期間（日）", [1, 3, 7, 14, 30], index=2)
-    sample = c2.selectbox("1タイトルあたり取得数", [10, 25, 50], index=1)
-    if st.button("ゲームを比較", disabled=not api_key):
-        games = [x.strip() for x in games_text.splitlines() if x.strip()]
+for tab, mode in [(tabs[2], "games"), (tabs[3], "opportunity")]:
+    with tab:
+        st.subheader("ゲームタイトル比較" if mode == "games" else "狙い目ゲームランキング")
+        text = st.text_area("1行に1タイトル（最大10件）", "Minecraft\nFortnite\nVALORANT\nApex Legends\nRoblox", key=mode + "_text")
+        a, b = st.columns(2)
+        days = a.selectbox("比較期間（日）", [1, 3, 7, 14, 30], index=2, key=mode + "_days")
+        sample = b.selectbox("1タイトルあたり取得数", [10, 25, 50, 100, 200], index=1, key=mode + "_sample")
+        games = list(dict.fromkeys(x.strip() for x in text.splitlines() if x.strip()))
         if len(games) > 10:
-            st.warning("API使用量を抑えるため、一度に10タイトルまでを推奨します。")
-        results = []
-        try:
-            prog = st.progress(0)
-            for idx, game in enumerate(games):
-                df = search_videos(game, game_days, sample, api_key, region)
-                if not df.empty:
-                    results.append({
-                        "game": game,
-                        "videos_sampled": len(df),
-                        "sample_views": int(df["views"].sum()),
-                        "median_views": float(df["views"].median()),
-                        "median_views_per_hour": float(df["views_per_hour"].median()),
-                        "active_channels": int(df["channel_id"].nunique()),
-                        "median_like_rate_pct": float(df["like_rate_pct"].median()),
-                    })
-                prog.progress((idx + 1) / max(len(games), 1))
-            rdf = pd.DataFrame(results)
-            if not rdf.empty:
-                # Cross-game score favors velocity, sustained channel breadth, and engagement.
-                rdf["game_trend_score"] = (
-                    55 * rdf["median_views_per_hour"].rank(pct=True) +
-                    25 * rdf["active_channels"].rank(pct=True) +
-                    20 * rdf["median_like_rate_pct"].rank(pct=True)
-                ).round(1)
-                rdf = rdf.sort_values("game_trend_score", ascending=False)
-            st.session_state["games_df"] = rdf
-        except Exception as e:
-            st.error(str(e))
-    rdf = st.session_state.get("games_df", pd.DataFrame())
-    if not rdf.empty:
-        st.dataframe(rdf, use_container_width=True, hide_index=True)
-        st.bar_chart(rdf.set_index("game")["game_trend_score"])
-        dataframe_download(rdf, "youtube_game_ranking.csv")
+            st.warning("一度に分析できるのは10タイトルまでです。")
+        if st.button("ゲームを比較" if mode == "games" else "狙い目を分析", key=mode + "_button", disabled=not api_key or not 1 <= len(games) <= 10):
+            try:
+                with st.spinner("動画とチャンネル情報を取得中..."):
+                    raw = collect_games(games, days, sample)
+                st.session_state[mode + "_raw"] = raw
+                st.session_state[mode + "_names"] = games
+                st.session_state[mode + "_context"] = f"取得条件：直近{days}日 / 地域 {region} / 各最大 {sample}件"
+            except Exception as exc:
+                st.error(str(exc))
+        if mode + "_raw" in st.session_state:
+            raw = st.session_state[mode + "_raw"]
+            st.caption(st.session_state[mode + "_context"])
+            filtered = filter_videos(raw, filters)
+            rows = []
+            for game in st.session_state[mode + "_names"]:
+                df = filtered[filtered.game == game]
+                rows.append({"game": game, "videos_fetched": len(raw[raw.game == game]), **summarize(df)})
+            rdf = pd.DataFrame(rows)
+            valid = rdf.videos_sampled > 0
+            ranked = rdf.loc[valid]
+            score_name = "game_trend_score" if mode == "games" else "opportunity_score"
+            rdf[score_name] = float("nan")
+            if not ranked.empty:
+                if mode == "games":
+                    scores = 55 * ranked.median_views_per_hour.rank(pct=True) + 25 * ranked.active_channels.rank(pct=True) + 20 * ranked.median_like_rate_pct.rank(pct=True)
+                else:
+                    scores = 40 * ranked.median_views_per_hour.rank(pct=True) + 25 * ranked.breakout_ratio.rank(pct=True).fillna(0) + 15 * ranked.engagement.rank(pct=True) + 20 * (1 - ranked.active_channels.rank(pct=True) + 1 / len(ranked))
+                rdf.loc[valid, score_name] = scores.clip(0, 100).round(1)
+            else:
+                st.info("条件に一致する動画がありません。条件を緩めてください。")
+            rdf = rdf.sort_values(score_name, ascending=False, na_position="last")
+            st.dataframe(rdf, column_config=SUMMARY_LABELS, use_container_width=True, hide_index=True)
+            if valid.any():
+                st.bar_chart(rdf.set_index("game")[score_name].dropna())
+            st.caption("スコアは条件一致サンプル内の相対評価です。0件は順位対象外。登録者比不明はその加点を0とします。競合数はサンプル内のチャンネル数です。")
+            download(rdf, f"youtube_{mode}_ranking.csv")
+            with st.expander("比較に使った動画とチャンネル規模を見る"):
+                show_videos(raw, f"youtube_{mode}_videos.csv")
 
-with opportunity_tab:
-    st.subheader("狙い目ゲームランキング")
-    st.caption("需要の強さ・競合の少なさ・最近の勢い・エンゲージメントを組み合わせた独自指標です。")
-    default_op = "Minecraft\nFortnite\nVALORANT\nApex Legends\nRoblox\nゼンレスゾーンゼロ"
-    op_text = st.text_area("比較したいゲーム（1行1タイトル）", value=default_op, height=170, key="op_games")
-    oc1, oc2 = st.columns(2)
-    op_days = oc1.selectbox("対象期間（日）", [3, 7, 14, 30], index=1, key="op_days")
-    op_sample = oc2.selectbox("1タイトルあたり取得数", [10, 25, 50], index=1, key="op_sample")
-    if st.button("狙い目を分析", disabled=not api_key, key="op_btn"):
-        games = [x.strip() for x in op_text.splitlines() if x.strip()][:10]
+with tabs[4]:
+    st.subheader("長期トレンド（30日区間ごとのサンプリング）")
+    st.warning("各動画の現在の累計再生数と現在のチャンネル規模を集計します。当時の月間再生数・登録者数ではありません。")
+    a, b, c = st.columns(3)
+    query = a.text_input("ゲームタイトル", "Minecraft", key="long_query")
+    months = b.selectbox("期間", [3, 6, 12, 24], index=1, format_func=lambda x: f"{x}か月")
+    sample = c.selectbox("各区間の上位取得数", [5, 10, 25, 50], index=1)
+    st.caption(f"検索API呼び出しは最大 {months} 回。チャンネル情報は区間をまたいでまとめて取得します。")
+    if st.button("長期分析を実行", disabled=not api_key or not query.strip()):
+        try:
+            with st.spinner("区間ごとに取得中..."):
+                now = datetime.now(timezone.utc)
+                parts, periods = [], []
+                for offset in range(months - 1, -1, -1):
+                    end = now - timedelta(days=30 * offset)
+                    start = end - timedelta(days=30)
+                    period = start.strftime("%Y-%m-%d") + "〜" + end.strftime("%Y-%m-%d")
+                    df = search_period(query.strip(), start, end, sample, api_key, region)
+                    df["period"] = period
+                    periods.append(period)
+                    parts.append(df)
+                raw = add_channel_stats(pd.concat(parts, ignore_index=True), api_key)
+            st.session_state.long_raw = raw
+            st.session_state.long_periods = periods
+            st.session_state.long_context = f"取得条件：{query.strip()} / 地域 {region} / 各区間最大 {sample}件"
+        except Exception as exc:
+            st.error(str(exc))
+    if "long_raw" in st.session_state:
+        st.caption(st.session_state.long_context)
+        raw = st.session_state.long_raw
+        filtered = filter_videos(raw, filters)
         rows = []
-        try:
-            prog = st.progress(0)
-            for idx, game in enumerate(games):
-                df = search_videos(game, op_days, op_sample, api_key, region)
-                if not df.empty:
-                    demand = float(df["views_per_hour"].median())
-                    competition = max(int(df["channel_id"].nunique()), 1)
-                    engagement = float((df["like_rate_pct"] + 5 * df["comment_rate_pct"]).median())
-                    breakout = float(df["views_vs_subscribers"].replace([math.inf, -math.inf], 0).median())
-                    rows.append({"game": game, "videos_sampled": len(df), "median_views": float(df["views"].median()), "demand_velocity": demand, "active_channels": competition, "engagement": engagement, "breakout_ratio": breakout})
-                prog.progress((idx + 1) / max(len(games), 1))
-            odf = pd.DataFrame(rows)
-            if not odf.empty:
-                # Higher demand/breakout/engagement is good; fewer active sampled channels is treated as lower competition.
-                odf["opportunity_score"] = (
-                    40 * odf["demand_velocity"].rank(pct=True) +
-                    25 * odf["breakout_ratio"].rank(pct=True) +
-                    15 * odf["engagement"].rank(pct=True) +
-                    20 * (1 - odf["active_channels"].rank(pct=True) + 1/len(odf))
-                ).clip(0, 100).round(1)
-                odf = odf.sort_values("opportunity_score", ascending=False)
-            st.session_state["opportunity_df"] = odf
-        except Exception as e:
-            st.error(str(e))
-    odf = st.session_state.get("opportunity_df", pd.DataFrame())
-    if not odf.empty:
-        st.dataframe(odf[["opportunity_score", "game", "median_views", "demand_velocity", "active_channels", "engagement", "breakout_ratio"]], use_container_width=True, hide_index=True)
-        st.bar_chart(odf.set_index("game")["opportunity_score"])
-        st.info("狙い目スコアはYouTube公式指標ではありません。検索結果サンプル内での相対評価です。競合数もYouTube全体の投稿者総数ではなく、取得サンプル内のアクティブチャンネル数を使用しています。")
-        dataframe_download(odf, "youtube_opportunity_ranking.csv")
-
-with long_tab:
-    st.subheader("長期トレンド（月別サンプリング）")
-    st.warning("長期分析は search.list を月ごとに使用します。APIの検索クォータを多く消費するため、少数タイトルで試してください。")
-    c1, c2, c3 = st.columns(3)
-    long_q = c1.text_input("ゲームタイトル", value="Minecraft", key="long_q")
-    months = c2.selectbox("期間", [3, 6, 12, 24], index=1, format_func=lambda x: f"{x}か月")
-    per_month = c3.selectbox("各月の上位取得数", [5, 10, 25, 50], index=1)
-    st.caption(f"この実行では概ね {months} 回の検索API呼び出しを行います。")
-    if st.button("長期分析を実行", disabled=not api_key):
-        try:
-            with st.spinner("月ごとのデータを取得中..."):
-                ldf = monthly_long_term(long_q, months, per_month, api_key, region)
-            st.session_state["long_df"] = ldf
-        except Exception as e:
-            st.error(str(e))
-    ldf = st.session_state.get("long_df", pd.DataFrame())
-    if not ldf.empty:
-        st.dataframe(ldf, use_container_width=True, hide_index=True)
-        st.line_chart(ldf.set_index("month")[["median_views", "sample_views"]])
-        st.line_chart(ldf.set_index("month")[["active_channels"]])
-        dataframe_download(ldf, f"youtube_longterm_{long_q}.csv")
+        for period in st.session_state.long_periods:
+            df = filtered[filtered.period == period]
+            rows.append({"period": period, "videos_fetched": len(raw[raw.period == period]), **summarize(df)})
+        ldf = pd.DataFrame(rows)
+        st.dataframe(ldf, column_config=SUMMARY_LABELS, use_container_width=True, hide_index=True)
+        st.line_chart(ldf.set_index("period")[["median_views", "sample_views"]])
+        st.line_chart(ldf.set_index("period")[["active_channels"]])
+        download(ldf, "youtube_longterm.csv")
+        with st.expander("長期分析に使った動画を見る"):
+            show_videos(raw, "youtube_longterm_videos.csv")
 
 st.divider()
-st.caption("Trend ScoreはYouTube公式指標ではなく、このツール独自の比較スコアです。公開データのサンプルから相対評価します。")
+st.caption("データ応答は15分間キャッシュします。Shorts候補は3分以下という長さだけの推定です。独自スコアはYouTube公式指標ではありません。")
