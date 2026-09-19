@@ -79,7 +79,11 @@ def video_rows(items: list) -> pd.DataFrame:
             "likes": likes,
             "comments": comments,
             "duration_sec": sec,
-            "format": "Shorts候補" if sec <= 180 else "長尺",
+            "format": "形式不明" if sec <= 0 else ("Shorts候補" if sec <= 180 else "長尺"),
+            "audio_language": sn.get("defaultAudioLanguage", ""),
+            "default_language": sn.get("defaultLanguage", ""),
+            "language": sn.get("defaultAudioLanguage") or sn.get("defaultLanguage") or "",
+            "language_source": "音声の登録言語" if sn.get("defaultAudioLanguage") else ("タイトル・説明の登録言語" if sn.get("defaultLanguage") else "未登録"),
             "views_per_hour": views / age_hours,
             "like_rate_pct": (likes / views * 100) if views else 0,
             "comment_rate_pct": (comments / views * 100) if views else 0,
@@ -88,15 +92,17 @@ def video_rows(items: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def add_channel_stats(df: pd.DataFrame, api_key: str) -> pd.DataFrame:
+def add_channel_stats(df: pd.DataFrame, api_key: str, channel_map=None) -> pd.DataFrame:
     if df.empty:
         return df.copy()
-    ids = sorted(set(df["channel_id"].dropna()) - {""})
-    channel_map = {}
+    channel_map = {} if channel_map is None else channel_map
+    ids = sorted(set(df["channel_id"].dropna()) - {""} - set(channel_map))
     for i in range(0, len(ids), 50):
         data = api_get("channels", {
             "part": "statistics", "id": ",".join(ids[i:i+50]), "maxResults": 50,
         }, api_key)
+        # Cache missing channels too, but never cache a failed request.
+        channel_map.update({cid: {} for cid in ids[i:i+50]})
         for item in data.get("items", []):
             s = item.get("statistics", {})
             hidden = s.get("hiddenSubscriberCount", False)
@@ -138,7 +144,25 @@ def filter_videos(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
         mask &= df["subscribers"].le(filters["small_max"])
     if filters.get("format", "すべて") != "すべて":
         mask &= df["format"].eq(filters["format"])
+    if filters.get("language"):
+        wanted = normalize_language(filters["language"])
+        langs = df["language"].fillna("").map(normalize_language)
+        language_mask = langs.eq(wanted)
+        if filters.get("include_unknown_language", False):
+            language_mask |= langs.eq("")
+        mask &= language_mask
     return df.loc[mask.fillna(False)].copy()
+
+
+def normalize_language(value):
+    code = str(value or "").lower().replace("_", "-")
+    if code.startswith("zh"):
+        if any(part in code.split("-") for part in ("hans", "cn", "sg")):
+            return "zh-hans"
+        if any(part in code.split("-") for part in ("hant", "tw", "hk", "mo")):
+            return "zh-hant"
+        return code
+    return code.split("-")[0]
 
 
 def score_df(df: pd.DataFrame) -> pd.DataFrame:
