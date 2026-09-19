@@ -2,11 +2,12 @@ import os
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import streamlit as st
-from analyzer import score_df
-from matching import collect_matching
+from yt_analyzer_v21 import score_df
+from yt_matching_v21 import collect_matching
 
 st.set_page_config(page_title="YouTube Trend Analyzer", page_icon="📈", layout="wide")
 st.title("📈 YouTube Trend Analyzer")
+st.caption("バージョン 2.1 — ファイル混在対策版")
 st.caption("ゲーム動画のトレンドと、自分に近い規模のチャンネルで伸びている動画を探す")
 PRESETS = {"指定なし": (None, None), "0〜1,000人未満": (0, 999), "1,000〜1万人未満": (1000, 9999), "1万〜10万人未満": (10000, 99999), "10万〜100万人未満": (100000, 999999), "100万人以上": (1000000, None), "任意入力": (None, None)}
 

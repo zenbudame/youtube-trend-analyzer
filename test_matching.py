@@ -5,8 +5,8 @@ from unittest.mock import patch
 
 import pandas as pd
 from streamlit.testing.v1 import AppTest
-import analyzer as a
-from matching import collect_matching
+import yt_analyzer_v21 as a
+from yt_matching_v21 import collect_matching
 from test_analyzer import video
 
 

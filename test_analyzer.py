@@ -7,7 +7,7 @@ from unittest.mock import patch, Mock
 import pandas as pd
 import requests
 from streamlit.testing.v1 import AppTest
-import analyzer as a
+import yt_analyzer_v21 as a
 
 
 def video(vid, channel="c1"):

@@ -1,3 +1,15 @@
+# バージョン2.1の更新手順
+
+`add_channel_stats() takes 2 positional arguments but 3 were given` は、呼び出し側と読み込まれた処理側の引数が一致していないことを示します。配布したv2の関数は3引数に対応しているため、公開先で旧ファイルまたは旧モジュールが読み込まれている可能性があります。公開先自体は未調査です。
+
+本版は処理ファイルを固有名に変更し、旧analyzer.py/matching.pyを参照しないようにしました。
+
+1. ZIPを解凍し、すべてのファイルを既存のapp.pyと同じ階層へまとめてアップロードしてください。
+2. 必須の処理ファイルは `app.py`、`yt_analyzer_v21.py`、`yt_matching_v21.py`、`requirements.txt` です。
+3. 起動ファイルは引き続き `app.py` です。APIキーの設定は変更不要です。
+4. 画面上部に「バージョン 2.1」が表示されることを確認してください。表示されない場合は、公開先が参照するリポジトリ・ブランチ・app.pyの場所を確認し、アプリを再起動してください。
+5. 旧analyzer.py/matching.pyがリポジトリに残っていても本版では読み込みません。
+
 # YouTube Trend Analyzer — 条件一致件数・言語・形式別一覧対応版
 
 人気動画・キーワード分析・ゲーム比較・狙い目ランキング・長期トレンド・CSV出力を維持したStreamlitアプリです。
@@ -67,7 +79,7 @@ API応答は15分間キャッシュします。再実行時も同じリクエス
 
 ## 無料Web公開・既存アプリの更新
 
-1. ZIPを解凍し、`app.py`、`analyzer.py`、`matching.py`、`requirements.txt`、README等をGitHubリポジトリのルートに配置します。**analyzer.pyとmatching.pyも必須です。** ZIPそのものをアップロードしないでください。
+1. ZIPを解凍し、`app.py`、`yt_analyzer_v21.py`、`yt_matching_v21.py`、`requirements.txt`、README等をGitHubリポジトリのルートに配置します。**yt_analyzer_v21.pyとyt_matching_v21.pyも必須です。** ZIPそのものをアップロードしないでください。
 2. 既存アプリは同じリポジトリのファイルを更新します。エントリポイントは引き続き `app.py` です。
 3. 新規の場合はStreamlit Community CloudでGitHubを接続して「Create app」、対象リポジトリと `app.py` を指定します。
 4. Pythonは3.11以降を使用してください。依存関係はrequirements.txtからインストールされます。
